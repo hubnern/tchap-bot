@@ -1,0 +1,18 @@
+[package]
+name = "tchap-crous-bot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
+dirs = "6.0.0"
+dotenvy = "0.15.7"
+matrix-sdk = { version = "0.16.0", features = ["anyhow", "markdown"] }
+rand = "0.10.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+tokio = { version = "1.50.0", features = ["full"] }
+toml = "1.1.0"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "tracing"] }
