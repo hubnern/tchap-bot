@@ -216,17 +216,11 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
             // Ignore our redactions
             return;
         }
-        // if let Some(r) = ev.content.reason
-        //     && r.starts_with(BOT_PREFIX)
-        // {
-        //     // this is a redaction sent by us, let's ignore it
-        //     return;
-        // }
         if let Some(redacted_event) = ev.content.redacts {
             let mut data = data1.lock().await;
             if data.remove_selection_by_id(&redacted_event).is_some() {
                 //update poll
-                let poll_msg = poll::create_poll(data.clone()).await;
+                let poll_msg = poll::create_poll_message(data.clone()).await;
                 let replacement = poll_msg.make_replacement(ReplacementMetadata::new(
                     data.poll_event_id.clone().unwrap(),
                     None,
@@ -258,7 +252,7 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                         .await;
                     // info!("sent emoji redaction");
                 }
-                let poll_msg = poll::create_poll(data.clone()).await;
+                let poll_msg = poll::create_poll_message(data.clone()).await;
                 let replacement = poll_msg.make_replacement(ReplacementMetadata::new(message_id, None));
                 room.send(replacement).await.unwrap();
             }
@@ -288,10 +282,11 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                 todo!("send the poll every day at x hour");
             }
             "!menu" => {
-                todo!("send the today's haut-carre menu");
+                let content = poll::create_menu_message().await;
+                room.send(content).await.unwrap();
             }
             "!poll" => {
-                let content = poll::create_poll(data.lock().await.clone()).await;
+                let content = poll::create_poll_message(data.lock().await.clone()).await;
                 info!("sending poll");
                 let r = room.send(content).await.unwrap();
                 let poll_event_id = r.event_id;

@@ -1,10 +1,11 @@
+use chrono::Local;
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use maud::{PreEscaped, html};
 use tracing::error;
 
 use crate::{BotData, PollSelection, crous::fetch_restaurant_menus};
 
-pub async fn create_poll(data: BotData) -> RoomMessageEventContent {
+pub async fn create_poll_message(data: BotData) -> RoomMessageEventContent {
     let dishes = match fetch_restaurant_menus().await {
         Ok(d) => d,
         Err(e) => {
@@ -67,3 +68,28 @@ pub async fn create_poll(data: BotData) -> RoomMessageEventContent {
     RoomMessageEventContent::text_html("the poll, but your client doesn't render html", html_content)
 }
 
+pub async fn create_menu_message() -> RoomMessageEventContent {
+    let dishes = match fetch_restaurant_menus().await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("error fetching crous menus: {}", e);
+            vec![]
+        }
+    };
+    let html_content = html! {
+        h3 { "Menu du " (Local::now().format("%Y-%m-%d")) }
+        p { 
+            @for dish in dishes.iter().filter(|d|!d.food.contains("menu non communiqué")) {
+                (dish.style) i { ": " (dish.food) }
+                br;
+            }
+        }
+    };
+    let raw_content = dishes
+        .iter()
+        .filter(|d| !d.food.contains("menu non communiqué"))
+        .map(|d| format!("{}: {}", d.style, d.food))
+        .collect::<Vec<String>>()
+        .join("\n");
+    RoomMessageEventContent::text_html(raw_content, html_content)
+}
