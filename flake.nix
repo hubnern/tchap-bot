@@ -24,19 +24,22 @@
         };
       in
       rec {
-        # packages = rec {
-        #   crous = pkgs.rustPlatform.buildRustPackage {
-        #     pname = "crous";
-        #     version = "0.2.0";
-        #     src = ./.;
-        #     cargoLock.lockFile = ./Cargo.lock;
-        #     nativeBuildInputs = [ pkgs.pkg-config ];
-        #     buildInputs = [ pkgs.openssl ];
-        #   };
-        #   default = crous;
-        # };
-        #
-        # legacyPackages = packages;
+        packages = rec {
+          tchap-bot = pkgs.rustPlatform.buildRustPackage {
+            pname = "tchap-bot";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ pkgs.pkg-config ];
+            buildInputs = [
+              pkgs.openssl
+              pkgs.sqlite
+            ];
+          };
+          default = tchap-bot;
+        };
+
+        legacyPackages = packages;
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
