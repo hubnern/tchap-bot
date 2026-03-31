@@ -1,29 +1,31 @@
-use std::{collections::HashMap, hash::Hash, num::TryFromIntError, path::Path, sync::Arc};
+use std::{collections::HashMap, hash::Hash, path::Path, sync::Arc};
 
 use matrix_sdk::{
-    Client, Error, LoopCtrl, Result, Room, RoomState,
+    Client, Error, LoopCtrl, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        EventId, OwnedEventId, OwnedMxcUri, OwnedUserId, UserId,
-        api::client::{
-            filter::FilterDefinition,
-            profile::{self, AvatarUrl, DisplayName},
-        },
+        OwnedEventId, OwnedUserId,
+        api::client::filter::FilterDefinition,
         events::{
-            reaction::OriginalSyncReactionEvent,
+            reaction::{OriginalSyncReactionEvent, ReactionEventContent},
+            relation::Annotation,
             room::{
-                message::{MessageType, OriginalSyncRoomMessageEvent, RoomMessageEventContent},
-                redaction::{OriginalSyncRoomRedactionEvent, RoomRedactionEvent, RoomRedactionEventContent},
+                message::{
+                    MessageType, OriginalSyncRoomMessageEvent, ReplacementMetadata, RoomMessageEventContent,
+                },
+                redaction::OriginalSyncRoomRedactionEvent,
             },
         },
     },
 };
+use strum::{EnumIter, IntoEnumIterator};
 use tokio::sync::Mutex;
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::persist_session::{login, persist_sync_token, restore_session};
 
+mod crous;
 mod emoji_verification;
 mod persist_session;
 mod poll;
@@ -53,8 +55,8 @@ async fn main() -> anyhow::Result<()> {
     sync(client, sync_token, &session_file).await
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PollSelection {
+#[derive(Debug, Clone, Copy, EnumIter)]
+pub enum PollSelection {
     LabriWithFood,
     LabriBuyFood,
     Crous,
@@ -63,7 +65,7 @@ enum PollSelection {
 }
 
 impl PollSelection {
-    fn as_emoji(&self) -> &str {
+    pub fn as_emoji(&self) -> String {
         match self {
             Self::LabriWithFood => "1️⃣",
             Self::LabriBuyFood => "2️⃣",
@@ -71,10 +73,11 @@ impl PollSelection {
             Self::Cnrs => "4️⃣",
             Self::Other => "5️⃣",
         }
+        .to_string()
     }
 }
 
-struct TryFromStringError;
+pub struct TryFromStringError;
 impl TryFrom<String> for PollSelection {
     type Error = TryFromStringError;
 
@@ -91,24 +94,26 @@ impl TryFrom<String> for PollSelection {
 }
 
 #[derive(Debug, Default, Clone)]
-struct BotData {
-    poll_event_id: Option<OwnedEventId>,
+pub struct BotData {
+    pub poll_event_id: Option<OwnedEventId>,
     // selections: HashMap<OwnedUserId, Vec<(OwnedEventId, String)>>
-    labri_buy_food: HashMap<OwnedUserId, OwnedEventId>,
-    labri_with_food: HashMap<OwnedUserId, OwnedEventId>,
-    crous: HashMap<OwnedUserId, OwnedEventId>,
-    cnrs: HashMap<OwnedUserId, OwnedEventId>,
-    other: HashMap<OwnedUserId, OwnedEventId>,
+    pub labri_buy_food: HashMap<OwnedUserId, OwnedEventId>,
+    pub labri_with_food: HashMap<OwnedUserId, OwnedEventId>,
+    pub crous: HashMap<OwnedUserId, OwnedEventId>,
+    pub cnrs: HashMap<OwnedUserId, OwnedEventId>,
+    pub other: HashMap<OwnedUserId, OwnedEventId>,
 }
 
 impl BotData {
-    fn reset(&mut self, poll_event_id: OwnedEventId) {
-        self.poll_event_id = Some(poll_event_id);
+    fn reset(&mut self, poll_event_id: &OwnedEventId) -> Option<OwnedEventId> {
+        let old_poll_event = self.poll_event_id.clone();
+        self.poll_event_id = Some(poll_event_id.clone());
         self.labri_buy_food = HashMap::new();
         self.labri_with_food = HashMap::new();
         self.crous = HashMap::new();
         self.cnrs = HashMap::new();
         self.other = HashMap::new();
+        old_poll_event
     }
 
     /// Remove the selection of a user, by its event id
@@ -152,16 +157,17 @@ impl BotData {
         e
     }
 
-    /// User unselected on an option.
-    fn user_unselect(&mut self, user_id: &OwnedUserId) {
-        self.remove_selection_for_user(user_id);
-    }
+    // /// User unselected on an option.
+    // fn user_unselect(&mut self, user_id: &OwnedUserId) {
+    //     self.remove_selection_for_user(user_id);
+    // }
 }
 
 const BOT_PREFIX: &str = "[poll-bot]";
 
 /// Setup the client to listen to new messages.
 async fn sync(client: Client, initial_sync_token: Option<String>, session_file: &Path) -> anyhow::Result<()> {
+    let user_id = client.user_id().unwrap().to_owned();
     info!("Launching a first sync to ignore past messages…");
 
     // Enable room members lazy-loading, it will speed up the initial sync a lot
@@ -203,24 +209,41 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
     let data = Arc::new(Mutex::new(BotData::default()));
 
     let data1 = data.clone();
+    let user_id1 = user_id.clone();
+    // let client1 = client.clone();
     client.add_event_handler(|ev: OriginalSyncRoomRedactionEvent, room: Room| async move {
-        if let Some(r) = ev.content.reason
-            && r.starts_with(BOT_PREFIX)
-        {
-            // this is a redaction sent by us, let's ignore it
+        if ev.sender == user_id1 {
+            // Ignore our redactions
             return;
         }
+        // if let Some(r) = ev.content.reason
+        //     && r.starts_with(BOT_PREFIX)
+        // {
+        //     // this is a redaction sent by us, let's ignore it
+        //     return;
+        // }
         if let Some(redacted_event) = ev.content.redacts {
             let mut data = data1.lock().await;
             if data.remove_selection_by_id(&redacted_event).is_some() {
                 //update poll
-                todo!("update poll after user unselection");
+                let poll_msg = poll::create_poll(data.clone()).await;
+                let replacement = poll_msg.make_replacement(ReplacementMetadata::new(
+                    data.poll_event_id.clone().unwrap(),
+                    None,
+                ));
+                room.send(replacement).await.unwrap();
             }
         }
     });
 
     let data2 = data.clone();
+    let user_id2 = user_id.clone();
+    // let client2 = client.clone();
     client.add_event_handler(|ev: OriginalSyncReactionEvent, room: Room| async move {
+        if ev.sender == user_id2 {
+            // Ignore our reactions
+            return;
+        }
         let message_id = ev.content.relates_to.event_id;
         let mut data = data2.lock().await;
         if let Some(msg_id) = &data.poll_event_id
@@ -230,21 +253,29 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
             if let Ok(selection) = PollSelection::try_from(emoji) {
                 let previous_selection = data.user_select(selection, ev.sender, ev.event_id);
                 if let Some(e) = previous_selection {
-                    let _ = room.redact(&e, Some(format!("{BOT_PREFIX} emoji unselection").as_str()), None)
+                    let _ = room
+                        .redact(&e, Some(format!("{BOT_PREFIX} emoji unselection").as_str()), None)
                         .await;
                     // info!("sent emoji redaction");
                 }
-                todo!("update poll after user selection");
+                let poll_msg = poll::create_poll(data.clone()).await;
+                let replacement = poll_msg.make_replacement(ReplacementMetadata::new(message_id, None));
+                room.send(replacement).await.unwrap();
             }
         }
         // info!("user emoji select {:?}", data);
     });
 
     // Now that we've synced, let's attach a handler for incoming room messages.
-    let data3 = data.clone();
+    // let data3 = data.clone();
+    // let client3 = client.clone();
     client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room| async move {
         // We only want to log text messages in joined rooms.
         if room.state() != RoomState::Joined {
+            return;
+        }
+        if event.sender == user_id {
+            // Ignore our reactions
             return;
         }
         let MessageType::Text(text_content) = &event.content.msgtype else {
@@ -252,15 +283,32 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
         };
 
         match text_content.body.as_str() {
-            "]]poll" => {
-                let content = poll::create_poll();
+            "!auto-poll" => {
+                // ]]auto-poll (true|false) <hour>
+                todo!("send the poll every day at x hour");
+            }
+            "!menu" => {
+                todo!("send the today's haut-carre menu");
+            }
+            "!poll" => {
+                let content = poll::create_poll(data.lock().await.clone()).await;
                 info!("sending poll");
                 let r = room.send(content).await.unwrap();
-                data.lock().await.reset(r.event_id);
-                todo!("send emoji base reactions");
-                // info!("poll sent {:?}", r);
+                let poll_event_id = r.event_id;
+                if let Some(old_poll_event) = data.lock().await.reset(&poll_event_id) {
+                    room.redact(&old_poll_event, Some(&format!("{BOT_PREFIX} poll ended")), None)
+                        .await
+                        .unwrap();
+                }
+                for poll_selection in PollSelection::iter() {
+                    let reaction = ReactionEventContent::new(Annotation::new(
+                        poll_event_id.clone(),
+                        poll_selection.as_emoji(),
+                    ));
+                    room.send(reaction).await.unwrap();
+                }
             }
-            "]]html" => {
+            "!html" => {
                 let content = RoomMessageEventContent::text_html(
                     "[bot] debug display of supported html tags",
                     HTML_DEBUG_MSG,
@@ -290,43 +338,6 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
         .await?;
 
     Ok(())
-}
-
-async fn create_mention_string(client: Client, user_id: &OwnedUserId) -> String {
-    let user_link = user_id.matrix_to_uri();
-    let profile = get_profile(client, user_id).await;
-    format!(
-        "<a href=\"{}\">{}</a>",
-        user_link,
-        profile
-            .ok()
-            .and_then(|p| p.displayname)
-            .unwrap_or("userdisplayname".to_string())
-    )
-}
-
-#[derive(Debug)]
-struct UserProfile {
-    avatar_url: Option<OwnedMxcUri>,
-    displayname: Option<String>,
-}
-
-async fn get_profile(client: Client, mxid: &UserId) -> Result<UserProfile> {
-    // First construct the request you want to make
-    // See https://docs.rs/ruma-client-api/latest/ruma_client_api/index.html for all available Endpoints
-    let request = profile::get_profile::v3::Request::new(mxid.to_owned());
-
-    // Start the request using matrix_sdk::Client::send
-    let resp = client.send(request).await?;
-
-    // Use the response and construct a UserProfile struct.
-    // See https://docs.rs/ruma-client-api/latest/ruma_client_api/profile/get_profile/v3/struct.Response.html
-    // for details on the Response for this Request
-    let user_profile = UserProfile {
-        avatar_url: resp.get_static::<AvatarUrl>()?,
-        displayname: resp.get_static::<DisplayName>()?,
-    };
-    Ok(user_profile)
 }
 
 trait HashMapExt<K, V> {
