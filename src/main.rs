@@ -33,7 +33,7 @@ mod poll;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     //https://www.tchap.gouv.fr/#/room/!jjgrGIYRRNERhDlWrU:agent.education.tchap.gouv.fr
-    dotenvy::dotenv()?;
+    // dotenvy::dotenv()?;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -319,18 +319,35 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
 
     info!("The client is ready! Listening to new messages…");
     // This loops until we kill the program or an error happens.
-    client
+    match client
         .sync_with_result_callback(sync_settings, |sync_result| async move {
-            let response = sync_result?;
+            let response = match sync_result {
+                Ok(it) => it,
+                Err(err) => {
+                    error!("error in the sync_result: {}", err);
+                    return Err(err);
+                }
+            };
 
             // We persist the token each time to be able to restore our session
-            persist_sync_token(session_file, response.next_batch)
-                .await
-                .map_err(|err| Error::UnknownError(err.into()))?;
+            match persist_sync_token(session_file, response.next_batch).await {
+                Ok(_) => {}
+                Err(err) => {
+                    error!("error in the persist sync token: {}", err);
+                    return Err(Error::UnknownError(err.into()));
+                }
+            }
 
             Ok(LoopCtrl::Continue)
         })
-        .await?;
+        .await
+    {
+        Ok(it) => it,
+        Err(err) => {
+            error!("error in the sync with result callback: {}", err);
+            return Err(err.into());
+        }
+    };
 
     Ok(())
 }
