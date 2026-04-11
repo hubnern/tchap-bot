@@ -11,9 +11,23 @@ pub struct Dish {
     pub food: String,
 }
 
+impl Dish {
+    pub fn error(reason: &str) -> Self {
+        Self {
+            style: String::new(),
+            food: String::from(reason),
+        }
+    }
+}
+
 const HAUT_CARRE: u32 = 411;
 
 static CACHE: LazyLock<Mutex<(String, Vec<Dish>)>> = LazyLock::new(|| Mutex::new((String::new(), vec![])));
+
+pub async fn clear_cache() {
+    let mut cached = CACHE.lock().await;
+    *cached = (String::new(), vec![]);
+}
 
 pub async fn fetch_restaurant_menus() -> reqwest::Result<Vec<Dish>> {
     let now = Local::now().format("%Y-%m-%d").to_string();
@@ -22,7 +36,7 @@ pub async fn fetch_restaurant_menus() -> reqwest::Result<Vec<Dish>> {
     if now == cached.0 {
         Ok(cached.1.clone())
     } else {
-        match inner_fetch_restaurant_menus().await {
+        match inner_fetch_restaurant_menus(now).await {
             Ok((date, dishes)) => {
                 *cached = (date, dishes.clone());
                 Ok(dishes)
@@ -31,7 +45,7 @@ pub async fn fetch_restaurant_menus() -> reqwest::Result<Vec<Dish>> {
         }
     }
 }
-async fn inner_fetch_restaurant_menus() -> reqwest::Result<(String, Vec<Dish>)> {
+async fn inner_fetch_restaurant_menus(now: String) -> reqwest::Result<(String, Vec<Dish>)> {
     info!("Fetching menu from the crous api");
     let url = "http://webservices-v2.crous-mobile.fr/feed/bordeaux/externe/crous-bordeaux.min.json";
     let cleaned_json: String = reqwest::get(url)
@@ -44,42 +58,46 @@ async fn inner_fetch_restaurant_menus() -> reqwest::Result<(String, Vec<Dish>)> 
         .collect();
 
     if let Ok(feed) = serde_json::from_str::<CrousFeed>(&cleaned_json) {
-        let first_menu = feed
+        if let Some(today_menu) = feed
             .restaurants
             .iter()
             .find(|r| r.id == HAUT_CARRE)
             .expect("the haut carre restaurant should be here")
             .menus
-            .first()
-            .expect("there should be at least one menu");
-        let date = first_menu.date.clone();
-        let meals = first_menu
-            .meal
-            .first()
-            .expect("there should be at least one meal")
-            .foodcategory
             .iter()
-            .map(|d| Dish {
-                style: d.name.clone(),
-                food: d
-                    .dishes
-                    .iter()
-                    .map(|e| {
-                        e.name
-                            .trim()
-                            .trim_end_matches('.')
-                            .replace(" ,", ", ")
-                            .replace("Ou", "")
-                            .replace("Où", "")
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|e| !e.is_empty())
-                    .collect::<Vec<String>>()
-                    .join(", "),
-            })
-            .collect();
-        Ok((date, meals))
+            .find(|menu| menu.date == now)
+        {
+            let date = today_menu.date.clone();
+            let meals = today_menu
+                .meal
+                .first()
+                .expect("there should be at least one meal")
+                .foodcategory
+                .iter()
+                .map(|d| Dish {
+                    style: d.name.clone(),
+                    food: d
+                        .dishes
+                        .iter()
+                        .map(|e| {
+                            e.name
+                                .trim()
+                                .trim_end_matches('.')
+                                .replace(" ,", ", ")
+                                .replace("Ou", "")
+                                .replace("Où", "")
+                                .trim()
+                                .to_string()
+                        })
+                        .filter(|e| !e.is_empty())
+                        .collect::<Vec<String>>()
+                        .join(", "),
+                })
+                .collect();
+            Ok((date, meals))
+        } else {
+            Ok((now, vec![Dish::error("Il n'y a pas de menu pour aujourd'hui")]))
+        }
     } else {
         eprintln!("Erreur de lecture de la liste des restaurants");
         Ok((String::new(), vec![]))

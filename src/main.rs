@@ -1,5 +1,6 @@
 use std::{collections::HashMap, hash::Hash, path::Path, sync::Arc};
 
+use chrono::{Datelike, Local, NaiveTime, TimeDelta, Weekday};
 use matrix_sdk::{
     Client, Error, LoopCtrl, Room, RoomState,
     config::SyncSettings,
@@ -19,7 +20,11 @@ use matrix_sdk::{
     },
 };
 use strum::{EnumIter, IntoEnumIterator};
-use tokio::sync::Mutex;
+use tokio::{
+    sync::Mutex,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -93,9 +98,10 @@ impl TryFrom<String> for PollSelection {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct BotData {
     pub polls: HashMap<OwnedRoomId, PollData>,
+    pub auto_polls: HashMap<OwnedRoomId, JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +272,8 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
         // info!("user emoji select {:?}", data);
     });
 
+    // let mut auto_poll_threads: Vec<_> = vec![];
+
     // Now that we've synced, let's attach a handler for incoming room messages.
     // let data3 = data.clone();
     // let client3 = client.clone();
@@ -282,54 +290,156 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
             return;
         };
 
-        match text_content.body.as_str() {
-            "!auto-poll" => {
-                // ]]auto-poll (true|false) <hour>
-                todo!("send the poll every day at x hour");
-            }
-            "!menu" => {
-                let content = poll::create_menu_message().await;
-                room.send(content).await.unwrap();
-            }
-            "!poll" => {
-                let mut bot_data = data.lock().await;
-                if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
-                    // there was a poll already created
-                    // wipe it and recreated it
-                    // todo: future, if poll is of the current day, copy the old data or ignore the
-                    // command
-                    room.redact(
-                        &old_poll_data.poll_event_id,
-                        Some(&format!("{BOT_PREFIX} poll ended")),
-                        None,
-                    )
-                    .await
-                    .unwrap();
+        if !text_content.body.starts_with("!") {
+            return;
+        }
+        if let Some(command) = text_content.body.strip_prefix("!") {
+            let command: Vec<&str> = command.split_whitespace().collect();
+            match command[0] {
+                "auto-poll" => {
+                    // !auto-poll (true|false) <hour> +no_we
+                    if command.len() < 2 {
+                        let _ = room
+                            .send(RoomMessageEventContent::text_plain("Missing start or stop"))
+                            .await;
+                        return;
+                    }
+                    match command[1] {
+                        "start" => {
+                            if command.len() < 3 {
+                                let _ = room
+                                    .send(RoomMessageEventContent::text_plain(
+                                        "Missing the time to send the poll",
+                                    ))
+                                    .await;
+                                return;
+                            }
+                            match NaiveTime::parse_from_str(command[2], "%H:%M") {
+                                Ok(wanted_time) => {
+                                    // valid duration, setup the auto poll
+                                    let now = Local::now();
+                                    let mut start = now
+                                        .date_naive()
+                                        .and_time(wanted_time)
+                                        .signed_duration_since(now.naive_local());
+                                    // time is after today's poll, start with tomorrow's poll
+                                    if start < TimeDelta::seconds(0) {
+                                        start += TimeDelta::days(1);
+                                    }
+                                    let one_day = TimeDelta::days(1).to_std().unwrap();
+                                    // let one_day = TimeDelta::days(1).to_std().unwrap();
+                                    let mut interval = tokio::time::interval_at(
+                                        Instant::now() + start.to_std().unwrap(),
+                                        one_day,
+                                    );
+                                    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                                    // let loop_data = data.clone();
+                                    let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
+                                    let cloned_room = room.clone();
+                                    let handle = tokio::spawn(async move {
+                                        let room = cloned_room;
+                                        loop {
+                                            interval.tick().await;
+                                            if skip_weekend
+                                                && matches!(
+                                                    Local::now().weekday(),
+                                                    Weekday::Sat | Weekday::Sun
+                                                )
+                                            {
+                                                // it is the weekend and we skip it
+                                                continue;
+                                            }
+                                            // it is the expected time of the day, send the poll
+                                            // let bot_data = loop_data.lock().await;
+                                            let _ = room
+                                                .send(RoomMessageEventContent::text_plain("todays poll"))
+                                                .await;
+                                        }
+                                    });
+                                    data.lock()
+                                        .await
+                                        .auto_polls
+                                        .insert(room.room_id().to_owned(), handle);
+                                    let _ = room
+                                        .send(RoomMessageEventContent::text_plain(format!(
+                                            "Scheduled a poll every day at {}",
+                                            command[2]
+                                        )))
+                                        .await;
+                                }
+                                Err(_) => {
+                                    let _ = room
+                                        .send(RoomMessageEventContent::text_plain(
+                                            "Not a valid time. Please format is as %H:%M",
+                                        ))
+                                        .await;
+                                }
+                            }
+                        }
+                        "stop" => {
+                            let mut bot_data = data.lock().await;
+                            if let Some(handle) = bot_data.auto_polls.remove(room.room_id()) {
+                                handle.abort();
+                                let _ = handle.await;
+                            }
+                            let _ = room
+                                .send(RoomMessageEventContent::text_plain("Auto poll stopped"))
+                                .await;
+                        }
+                        _ => {
+                            let _ = room
+                                .send(RoomMessageEventContent::text_plain("Value is not start nor stop"))
+                                .await;
+                        }
+                    }
                 }
-                let content = poll::create_poll_message().await;
-                info!("sending poll");
-                let r = room.send(content).await.unwrap();
-                let poll_data = PollData::new(r.event_id.clone());
-                for poll_selection in PollSelection::iter() {
-                    let reaction = ReactionEventContent::new(Annotation::new(
-                        poll_data.poll_event_id.clone(),
-                        poll_selection.as_emoji(),
-                    ));
-                    room.send(reaction).await.unwrap();
+                "menu" => {
+                    let content = poll::create_menu_message().await;
+                    room.send(content).await.unwrap();
                 }
-                bot_data.polls.insert(room.room_id().to_owned(), poll_data);
+                "poll" => {
+                    let mut bot_data = data.lock().await;
+                    if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
+                        // there was a poll already created
+                        // wipe it and recreated it
+                        // todo: future, if poll is of the current day, copy the old data or ignore the
+                        // command
+                        room.redact(
+                            &old_poll_data.poll_event_id,
+                            Some(&format!("{BOT_PREFIX} poll ended")),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    let content = poll::create_poll_message().await;
+                    info!("sending poll");
+                    let r = room.send(content).await.unwrap();
+                    let poll_data = PollData::new(r.event_id.clone());
+                    for poll_selection in PollSelection::iter() {
+                        let reaction = ReactionEventContent::new(Annotation::new(
+                            poll_data.poll_event_id.clone(),
+                            poll_selection.as_emoji(),
+                        ));
+                        room.send(reaction).await.unwrap();
+                    }
+                    bot_data.polls.insert(room.room_id().to_owned(), poll_data);
+                }
+                "clearcache" => {
+                    crous::clear_cache().await;
+                }
+                "html" => {
+                    let content = RoomMessageEventContent::text_html(
+                        "[bot] debug display of supported html tags",
+                        HTML_DEBUG_MSG,
+                    );
+                    // RoomMessageEventContent::emote_plain(":pray:");
+                    info!("sending message");
+                    room.send(content).await.unwrap();
+                    info!("message sent");
+                }
+                _ => {}
             }
-            "!html" => {
-                let content = RoomMessageEventContent::text_html(
-                    "[bot] debug display of supported html tags",
-                    HTML_DEBUG_MSG,
-                );
-                // RoomMessageEventContent::emote_plain(":pray:");
-                info!("sending message");
-                room.send(content).await.unwrap();
-                info!("message sent");
-            }
-            _ => {}
         }
     });
 
