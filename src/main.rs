@@ -314,6 +314,14 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                                     .await;
                                 return;
                             }
+                            if data.lock().await.auto_polls.contains_key(room.room_id()) {
+                                let _ = room
+                                    .send(RoomMessageEventContent::text_plain(
+                                        "An auto-poll is already scheduled for this room.",
+                                    ))
+                                    .await;
+                                return;
+                            }
                             match NaiveTime::parse_from_str(command[2], "%H:%M") {
                                 Ok(wanted_time) => {
                                     // valid duration, setup the auto poll
