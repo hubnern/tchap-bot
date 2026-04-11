@@ -176,6 +176,89 @@ impl PollData {
 
 const BOT_PREFIX: &str = "[poll-bot]";
 
+async fn send_poll(bot_data: Arc<Mutex<BotData>>, room: &Room) {
+    let mut bot_data = bot_data.lock().await;
+    if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
+        // there was a poll already created
+        // wipe it and recreated it
+        // todo: future, if poll is of the current day, copy the old data or ignore the
+        // command
+        room.redact(
+            &old_poll_data.poll_event_id,
+            Some(&format!("{BOT_PREFIX} poll ended")),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let content = poll::create_poll_message().await;
+    info!("sending poll");
+    let r = room.send(content).await.unwrap();
+    let poll_data = PollData::new(r.event_id.clone());
+    for poll_selection in PollSelection::iter() {
+        let reaction = ReactionEventContent::new(Annotation::new(
+            poll_data.poll_event_id.clone(),
+            poll_selection.as_emoji(),
+        ));
+        room.send(reaction).await.unwrap();
+    }
+    bot_data.polls.insert(room.room_id().to_owned(), poll_data);
+}
+
+async fn try_setup_auto_poll(bot_data: Arc<Mutex<BotData>>, room: &Room, time: &str, skip_weekend: bool) {
+    match NaiveTime::parse_from_str(time, "%H:%M") {
+        Ok(wanted_time) => {
+            // valid duration, setup the auto poll
+            let now = Local::now();
+            let mut start = now
+                .date_naive()
+                .and_time(wanted_time)
+                .signed_duration_since(now.naive_local());
+            // time is after today's poll, start with tomorrow's poll
+            if start < TimeDelta::seconds(0) {
+                start += TimeDelta::days(1);
+            }
+            let one_day = TimeDelta::days(1).to_std().unwrap();
+            // let one_day = TimeDelta::days(1).to_std().unwrap();
+            let mut interval = tokio::time::interval_at(Instant::now() + start.to_std().unwrap(), one_day);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            let thread_bot_data = bot_data.clone();
+            let cloned_room = room.clone();
+            let handle = tokio::spawn(async move {
+                let room = cloned_room;
+                loop {
+                    interval.tick().await;
+                    if skip_weekend && matches!(Local::now().weekday(), Weekday::Sat | Weekday::Sun) {
+                        // it is the weekend and we skip it
+                        continue;
+                    }
+                    // it is the expected time of the day, send the poll
+                    // let bot_data = loop_data.lock().await;
+                    send_poll(thread_bot_data.clone(), &room).await;
+                }
+            });
+            bot_data
+                .lock()
+                .await
+                .auto_polls
+                .insert(room.room_id().to_owned(), handle);
+            let _ = room
+                .send(RoomMessageEventContent::text_plain(format!(
+                    "Scheduled a poll every day at {}",
+                    time
+                )))
+                .await;
+        }
+        Err(_) => {
+            let _ = room
+                .send(RoomMessageEventContent::text_plain(
+                    "Not a valid time. Please format is as %H:%M",
+                ))
+                .await;
+        }
+    }
+}
+
 /// Setup the client to listen to new messages.
 async fn sync(client: Client, initial_sync_token: Option<String>, session_file: &Path) -> anyhow::Result<()> {
     let user_id = client.user_id().unwrap().to_owned();
@@ -322,67 +405,8 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                                     .await;
                                 return;
                             }
-                            match NaiveTime::parse_from_str(command[2], "%H:%M") {
-                                Ok(wanted_time) => {
-                                    // valid duration, setup the auto poll
-                                    let now = Local::now();
-                                    let mut start = now
-                                        .date_naive()
-                                        .and_time(wanted_time)
-                                        .signed_duration_since(now.naive_local());
-                                    // time is after today's poll, start with tomorrow's poll
-                                    if start < TimeDelta::seconds(0) {
-                                        start += TimeDelta::days(1);
-                                    }
-                                    let one_day = TimeDelta::days(1).to_std().unwrap();
-                                    // let one_day = TimeDelta::days(1).to_std().unwrap();
-                                    let mut interval = tokio::time::interval_at(
-                                        Instant::now() + start.to_std().unwrap(),
-                                        one_day,
-                                    );
-                                    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-                                    // let loop_data = data.clone();
-                                    let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
-                                    let cloned_room = room.clone();
-                                    let handle = tokio::spawn(async move {
-                                        let room = cloned_room;
-                                        loop {
-                                            interval.tick().await;
-                                            if skip_weekend
-                                                && matches!(
-                                                    Local::now().weekday(),
-                                                    Weekday::Sat | Weekday::Sun
-                                                )
-                                            {
-                                                // it is the weekend and we skip it
-                                                continue;
-                                            }
-                                            // it is the expected time of the day, send the poll
-                                            // let bot_data = loop_data.lock().await;
-                                            let _ = room
-                                                .send(RoomMessageEventContent::text_plain("todays poll"))
-                                                .await;
-                                        }
-                                    });
-                                    data.lock()
-                                        .await
-                                        .auto_polls
-                                        .insert(room.room_id().to_owned(), handle);
-                                    let _ = room
-                                        .send(RoomMessageEventContent::text_plain(format!(
-                                            "Scheduled a poll every day at {}",
-                                            command[2]
-                                        )))
-                                        .await;
-                                }
-                                Err(_) => {
-                                    let _ = room
-                                        .send(RoomMessageEventContent::text_plain(
-                                            "Not a valid time. Please format is as %H:%M",
-                                        ))
-                                        .await;
-                                }
-                            }
+                            let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
+                            try_setup_auto_poll(data, &room, command[2], skip_weekend).await;
                         }
                         "stop" => {
                             let mut bot_data = data.lock().await;
@@ -406,32 +430,7 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                     room.send(content).await.unwrap();
                 }
                 "poll" => {
-                    let mut bot_data = data.lock().await;
-                    if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
-                        // there was a poll already created
-                        // wipe it and recreated it
-                        // todo: future, if poll is of the current day, copy the old data or ignore the
-                        // command
-                        room.redact(
-                            &old_poll_data.poll_event_id,
-                            Some(&format!("{BOT_PREFIX} poll ended")),
-                            None,
-                        )
-                        .await
-                        .unwrap();
-                    }
-                    let content = poll::create_poll_message().await;
-                    info!("sending poll");
-                    let r = room.send(content).await.unwrap();
-                    let poll_data = PollData::new(r.event_id.clone());
-                    for poll_selection in PollSelection::iter() {
-                        let reaction = ReactionEventContent::new(Annotation::new(
-                            poll_data.poll_event_id.clone(),
-                            poll_selection.as_emoji(),
-                        ));
-                        room.send(reaction).await.unwrap();
-                    }
-                    bot_data.polls.insert(room.room_id().to_owned(), poll_data);
+                    send_poll(data.clone(), &room).await;
                 }
                 "clearcache" => {
                     crous::clear_cache().await;
