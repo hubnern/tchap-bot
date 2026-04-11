@@ -4,7 +4,7 @@ use matrix_sdk::{
     Client, Error, LoopCtrl, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::filter::FilterDefinition,
         events::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
@@ -33,7 +33,7 @@ mod poll;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     //https://www.tchap.gouv.fr/#/room/!jjgrGIYRRNERhDlWrU:agent.education.tchap.gouv.fr
-    // dotenvy::dotenv()?;
+    dotenvy::dotenv()?;
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
@@ -95,7 +95,12 @@ impl TryFrom<String> for PollSelection {
 
 #[derive(Debug, Default, Clone)]
 pub struct BotData {
-    pub poll_event_id: Option<OwnedEventId>,
+    pub polls: HashMap<OwnedRoomId, PollData>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PollData {
+    pub poll_event_id: OwnedEventId,
     // selections: HashMap<OwnedUserId, Vec<(OwnedEventId, String)>>
     pub labri_buy_food: HashMap<OwnedUserId, OwnedEventId>,
     pub labri_with_food: HashMap<OwnedUserId, OwnedEventId>,
@@ -104,16 +109,16 @@ pub struct BotData {
     pub other: HashMap<OwnedUserId, OwnedEventId>,
 }
 
-impl BotData {
-    fn reset(&mut self, poll_event_id: &OwnedEventId) -> Option<OwnedEventId> {
-        let old_poll_event = self.poll_event_id.clone();
-        self.poll_event_id = Some(poll_event_id.clone());
-        self.labri_buy_food = HashMap::new();
-        self.labri_with_food = HashMap::new();
-        self.crous = HashMap::new();
-        self.cnrs = HashMap::new();
-        self.other = HashMap::new();
-        old_poll_event
+impl PollData {
+    fn new(poll_event_id: OwnedEventId) -> Self {
+        Self {
+            poll_event_id,
+            labri_buy_food: HashMap::new(),
+            labri_with_food: HashMap::new(),
+            crous: HashMap::new(),
+            cnrs: HashMap::new(),
+            other: HashMap::new(),
+        }
     }
 
     /// Remove the selection of a user, by its event id
@@ -218,13 +223,13 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
         }
         if let Some(redacted_event) = ev.content.redacts {
             let mut data = data1.lock().await;
-            if data.remove_selection_by_id(&redacted_event).is_some() {
+            if let Some(poll_data) = data.polls.get_mut(room.room_id())
+                && poll_data.remove_selection_by_id(&redacted_event).is_some()
+            {
                 //update poll
-                let poll_msg = poll::create_poll_message(data.clone()).await;
-                let replacement = poll_msg.make_replacement(ReplacementMetadata::new(
-                    data.poll_event_id.clone().unwrap(),
-                    None,
-                ));
+                let poll_msg = poll::create_poll_message_with_data(poll_data.clone()).await;
+                let replacement = poll_msg
+                    .make_replacement(ReplacementMetadata::new(poll_data.poll_event_id.clone(), None));
                 room.send(replacement).await.unwrap();
             }
         }
@@ -240,19 +245,20 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
         }
         let message_id = ev.content.relates_to.event_id;
         let mut data = data2.lock().await;
-        if let Some(msg_id) = &data.poll_event_id
-            && msg_id == &message_id
+
+        if let Some(poll_data) = data.polls.get_mut(room.room_id())
+            && poll_data.poll_event_id == message_id
         {
             let emoji = ev.content.relates_to.key;
             if let Ok(selection) = PollSelection::try_from(emoji) {
-                let previous_selection = data.user_select(selection, ev.sender, ev.event_id);
+                let previous_selection = poll_data.user_select(selection, ev.sender, ev.event_id);
                 if let Some(e) = previous_selection {
                     let _ = room
                         .redact(&e, Some(format!("{BOT_PREFIX} emoji unselection").as_str()), None)
                         .await;
                     // info!("sent emoji redaction");
                 }
-                let poll_msg = poll::create_poll_message(data.clone()).await;
+                let poll_msg = poll::create_poll_message_with_data(poll_data.clone()).await;
                 let replacement = poll_msg.make_replacement(ReplacementMetadata::new(message_id, None));
                 room.send(replacement).await.unwrap();
             }
@@ -286,22 +292,32 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                 room.send(content).await.unwrap();
             }
             "!poll" => {
-                let content = poll::create_poll_message(data.lock().await.clone()).await;
+                let mut bot_data = data.lock().await;
+                if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
+                    // there was a poll already created
+                    // wipe it and recreated it
+                    // todo: future, if poll is of the current day, copy the old data or ignore the
+                    // command
+                    room.redact(
+                        &old_poll_data.poll_event_id,
+                        Some(&format!("{BOT_PREFIX} poll ended")),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                let content = poll::create_poll_message().await;
                 info!("sending poll");
                 let r = room.send(content).await.unwrap();
-                let poll_event_id = r.event_id;
-                if let Some(old_poll_event) = data.lock().await.reset(&poll_event_id) {
-                    room.redact(&old_poll_event, Some(&format!("{BOT_PREFIX} poll ended")), None)
-                        .await
-                        .unwrap();
-                }
+                let poll_data = PollData::new(r.event_id.clone());
                 for poll_selection in PollSelection::iter() {
                     let reaction = ReactionEventContent::new(Annotation::new(
-                        poll_event_id.clone(),
+                        poll_data.poll_event_id.clone(),
                         poll_selection.as_emoji(),
                     ));
                     room.send(reaction).await.unwrap();
                 }
+                bot_data.polls.insert(room.room_id().to_owned(), poll_data);
             }
             "!html" => {
                 let content = RoomMessageEventContent::text_html(

@@ -3,9 +3,36 @@ use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use maud::{PreEscaped, html};
 use tracing::error;
 
-use crate::{BotData, PollSelection, crous::fetch_restaurant_menus};
+use crate::{PollData, PollSelection, crous::fetch_restaurant_menus};
 
-pub async fn create_poll_message(data: BotData) -> RoomMessageEventContent {
+pub async fn create_poll_message() -> RoomMessageEventContent {
+    let dishes = match fetch_restaurant_menus().await {
+        Ok(d) => d,
+        Err(e) => {
+            error!("error fetching crous menus: {}", e);
+            vec![]
+        }
+    };
+    let html_content = html! {
+        h1 { "Miam Daily Poll" }
+        p { (PollSelection::LabriWithFood.as_emoji()) (PreEscaped("&nbsp;I will eat at LaBRI and already have my food")) }
+        p { (PollSelection::LabriBuyFood.as_emoji()) (PreEscaped("&nbsp;I will eat at LaBRI but need to pickup some food around 12")) }
+        p {
+            (PollSelection::Crous.as_emoji()) (PreEscaped("&nbsp;I will eat at the Haut Carré restaurant"))
+            br;
+            @for dish in dishes.iter().filter(|d|!d.food.contains("menu non communiqué")) {
+                (PreEscaped("&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"))
+                i { (dish.style) ": " (dish.food) }
+                br;
+            }
+        }
+        p { (PollSelection::Cnrs.as_emoji()) (PreEscaped("&nbsp;I will eat at the CNRS restaurant")) }
+        p { (PollSelection::Other.as_emoji()) (PreEscaped("&nbsp;I will eat somewhere else")) }
+    };
+    RoomMessageEventContent::text_html("the poll, but your client doesn't render html", html_content)
+}
+
+pub async fn create_poll_message_with_data(data: PollData) -> RoomMessageEventContent {
     let dishes = match fetch_restaurant_menus().await {
         Ok(d) => d,
         Err(e) => {
@@ -78,7 +105,7 @@ pub async fn create_menu_message() -> RoomMessageEventContent {
     };
     let html_content = html! {
         h3 { "Menu du " (Local::now().format("%Y-%m-%d")) }
-        p { 
+        p {
             @for dish in dishes.iter().filter(|d|!d.food.contains("menu non communiqué")) {
                 (dish.style) i { ": " (dish.food) }
                 br;
