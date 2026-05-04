@@ -5,7 +5,7 @@ use matrix_sdk::{
     Client, Error, LoopCtrl, Room, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId,
+        OwnedEventId, OwnedRoomId, OwnedUserId, RoomId,
         api::client::filter::FilterDefinition,
         events::{
             reaction::{OriginalSyncReactionEvent, ReactionEventContent},
@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .expect("no data_dir directory found")
         .join("matrix-crous-bot");
     let session_file = data_dir.join("session");
+    let auto_poll_file = data_dir.join("auto-polls.toml");
 
     let (client, sync_token) = if session_file.exists() {
         restore_session(&session_file).await?
@@ -57,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
     };
     info!("session started");
 
-    sync(client, sync_token, &session_file).await
+    sync(client, sync_token, &session_file, &auto_poll_file).await
 }
 
 #[derive(Debug, Clone, Copy, EnumIter)]
@@ -101,7 +102,7 @@ impl TryFrom<String> for PollSelection {
 #[derive(Debug, Default)]
 pub struct BotData {
     pub polls: HashMap<OwnedRoomId, PollData>,
-    pub auto_polls: HashMap<OwnedRoomId, JoinHandle<()>>,
+    pub auto_polls: HashMap<OwnedRoomId, (String, JoinHandle<()>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,7 +206,12 @@ async fn send_poll(bot_data: Arc<Mutex<BotData>>, room: &Room) {
     bot_data.polls.insert(room.room_id().to_owned(), poll_data);
 }
 
-async fn try_setup_auto_poll(bot_data: Arc<Mutex<BotData>>, room: &Room, time: &str, skip_weekend: bool) {
+async fn try_setup_auto_poll(
+    bot_data: Arc<Mutex<BotData>>,
+    room: &Room,
+    time: &str,
+    skip_weekend: bool,
+) -> bool {
     match NaiveTime::parse_from_str(time, "%H:%M") {
         Ok(wanted_time) => {
             // valid duration, setup the auto poll
@@ -241,13 +247,14 @@ async fn try_setup_auto_poll(bot_data: Arc<Mutex<BotData>>, room: &Room, time: &
                 .lock()
                 .await
                 .auto_polls
-                .insert(room.room_id().to_owned(), handle);
+                .insert(room.room_id().to_owned(), (time.to_string(), handle));
             let _ = room
                 .send(RoomMessageEventContent::text_plain(format!(
                     "Scheduled a poll every day at {}",
                     time
                 )))
                 .await;
+            true
         }
         Err(_) => {
             let _ = room
@@ -255,12 +262,24 @@ async fn try_setup_auto_poll(bot_data: Arc<Mutex<BotData>>, room: &Room, time: &
                     "Not a valid time. Please format is as %H:%M",
                 ))
                 .await;
+            false
         }
     }
 }
 
+async fn save_auto_polls(auto_poll_file: &Path, auto_polls: HashMap<String, String>) -> anyhow::Result<()> {
+    let s = toml::to_string(&auto_polls)?;
+    tokio::fs::write(auto_poll_file, &s).await?;
+    Ok(())
+}
+
 /// Setup the client to listen to new messages.
-async fn sync(client: Client, initial_sync_token: Option<String>, session_file: &Path) -> anyhow::Result<()> {
+async fn sync(
+    client: Client,
+    initial_sync_token: Option<String>,
+    session_file: &Path,
+    auto_poll_file: &Path,
+) -> anyhow::Result<()> {
     let user_id = client.user_id().unwrap().to_owned();
     info!("Launching a first sync to ignore past messages…");
 
@@ -301,6 +320,17 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
     emoji_verification::setup_device_verification(&client);
 
     let data = Arc::new(Mutex::new(BotData::default()));
+
+    // restore auto-polls
+    let serialized_auto_polls = tokio::fs::read_to_string(auto_poll_file).await?;
+    let auto_polls: HashMap<String, String> = toml::from_str(&serialized_auto_polls)?;
+    for (room_id_str, time) in auto_polls {
+        let room_id = <&RoomId>::try_from(&room_id_str[..])?;
+        if let Some(room) = client.get_room(room_id) {
+            try_setup_auto_poll(data.clone(), &room, &time, true).await;
+        };
+    }
+    info!("auto-polls restarted");
 
     let data1 = data.clone();
     let user_id1 = user_id.clone();
@@ -360,7 +390,9 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
     // Now that we've synced, let's attach a handler for incoming room messages.
     // let data3 = data.clone();
     // let client3 = client.clone();
+    let auto_poll_file_clone = auto_poll_file.to_path_buf();
     client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room| async move {
+        let owned_auto_poll_file = auto_poll_file_clone.clone();
         // We only want to log text messages in joined rooms.
         if room.state() != RoomState::Joined {
             return;
@@ -406,13 +438,34 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                                 return;
                             }
                             let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
-                            try_setup_auto_poll(data, &room, command[2], skip_weekend).await;
+                            if try_setup_auto_poll(data.clone(), &room, command[2], skip_weekend).await {
+                                let _ = save_auto_polls(
+                                    &owned_auto_poll_file,
+                                    data.lock()
+                                        .await
+                                        .auto_polls
+                                        .iter()
+                                        .map(|(k, v)| (k.to_string(), v.0.clone()))
+                                        .collect(),
+                                )
+                                .await;
+                            }
                         }
                         "stop" => {
                             let mut bot_data = data.lock().await;
-                            if let Some(handle) = bot_data.auto_polls.remove(room.room_id()) {
+                            if let Some((_, handle)) = bot_data.auto_polls.remove(room.room_id()) {
                                 handle.abort();
                                 let _ = handle.await;
+                                let _ = save_auto_polls(
+                                    &owned_auto_poll_file,
+                                    data.lock()
+                                        .await
+                                        .auto_polls
+                                        .iter()
+                                        .map(|(k, v)| (k.to_string(), v.0.clone()))
+                                        .collect(),
+                                )
+                                .await;
                             }
                             let _ = room
                                 .send(RoomMessageEventContent::text_plain("Auto poll stopped"))
@@ -458,7 +511,7 @@ async fn sync(client: Client, initial_sync_token: Option<String>, session_file: 
                 Ok(it) => it,
                 Err(err) => {
                     error!("error in the sync_result: {}", err);
-                    return Err(err);
+                    return Ok(LoopCtrl::Continue);
                 }
             };
 
