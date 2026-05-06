@@ -179,19 +179,20 @@ const BOT_PREFIX: &str = "[poll-bot]";
 
 async fn send_poll(bot_data: Arc<Mutex<BotData>>, room: &Room) {
     let mut bot_data = bot_data.lock().await;
-    if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
-        // there was a poll already created
-        // wipe it and recreated it
-        // todo: future, if poll is of the current day, copy the old data or ignore the
-        // command
-        room.redact(
-            &old_poll_data.poll_event_id,
-            Some(&format!("{BOT_PREFIX} poll ended")),
-            None,
-        )
-        .await
-        .unwrap();
-    }
+    // commented because I don't want to redact them anymore
+    // if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
+    //     // there was a poll already created
+    //     // wipe it and recreated it
+    //     // todo: future, if poll is of the current day, copy the old data or ignore the
+    //     // command
+    //     room.redact(
+    //         &old_poll_data.poll_event_id,
+    //         Some(&format!("{BOT_PREFIX} poll ended")),
+    //         None,
+    //     )
+    //     .await
+    //     .unwrap();
+    // }
     let content = poll::create_poll_message().await;
     info!("sending poll");
     let r = room.send(content).await.unwrap();
@@ -211,6 +212,7 @@ async fn try_setup_auto_poll(
     room: &Room,
     time: &str,
     skip_weekend: bool,
+    send_confirmation: bool,
 ) -> bool {
     match NaiveTime::parse_from_str(time, "%H:%M") {
         Ok(wanted_time) => {
@@ -248,12 +250,14 @@ async fn try_setup_auto_poll(
                 .await
                 .auto_polls
                 .insert(room.room_id().to_owned(), (time.to_string(), handle));
-            let _ = room
-                .send(RoomMessageEventContent::text_plain(format!(
-                    "Scheduled a poll every day at {}",
-                    time
-                )))
-                .await;
+            if send_confirmation {
+                let _ = room
+                    .send(RoomMessageEventContent::text_plain(format!(
+                        "Scheduled a poll every day at {}",
+                        time
+                    )))
+                    .await;
+            }
             true
         }
         Err(_) => {
@@ -327,7 +331,7 @@ async fn sync(
     for (room_id_str, time) in auto_polls {
         let room_id = <&RoomId>::try_from(&room_id_str[..])?;
         if let Some(room) = client.get_room(room_id) {
-            try_setup_auto_poll(data.clone(), &room, &time, true).await;
+            try_setup_auto_poll(data.clone(), &room, &time, true, false).await;
         };
     }
     info!("auto-polls restarted");
@@ -438,7 +442,7 @@ async fn sync(
                                 return;
                             }
                             let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
-                            if try_setup_auto_poll(data.clone(), &room, command[2], skip_weekend).await {
+                            if try_setup_auto_poll(data.clone(), &room, command[2], skip_weekend, true).await {
                                 let _ = save_auto_polls(
                                     &owned_auto_poll_file,
                                     data.lock()
