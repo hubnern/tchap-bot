@@ -19,6 +19,7 @@ use matrix_sdk::{
         },
     },
 };
+use maud::html;
 use strum::{EnumIter, IntoEnumIterator};
 use tokio::{
     sync::Mutex,
@@ -37,7 +38,6 @@ mod poll;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    //https://www.tchap.gouv.fr/#/room/!jjgrGIYRRNERhDlWrU:agent.education.tchap.gouv.fr
     dotenvy::dotenv()?;
 
     tracing_subscriber::registry()
@@ -108,7 +108,6 @@ pub struct BotData {
 #[derive(Debug, Clone)]
 pub struct PollData {
     pub poll_event_id: OwnedEventId,
-    // selections: HashMap<OwnedUserId, Vec<(OwnedEventId, String)>>
     pub labri_buy_food: HashMap<OwnedUserId, OwnedEventId>,
     pub labri_with_food: HashMap<OwnedUserId, OwnedEventId>,
     pub crous: HashMap<OwnedUserId, OwnedEventId>,
@@ -168,31 +167,28 @@ impl PollData {
         };
         e
     }
-
-    // /// User unselected on an option.
-    // fn user_unselect(&mut self, user_id: &OwnedUserId) {
-    //     self.remove_selection_for_user(user_id);
-    // }
 }
 
 const BOT_PREFIX: &str = "[poll-bot]";
 
 async fn send_poll(bot_data: Arc<Mutex<BotData>>, room: &Room) {
     let mut bot_data = bot_data.lock().await;
-    // commented because I don't want to redact them anymore
-    // if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
-    //     // there was a poll already created
-    //     // wipe it and recreated it
-    //     // todo: future, if poll is of the current day, copy the old data or ignore the
-    //     // command
-    //     room.redact(
-    //         &old_poll_data.poll_event_id,
-    //         Some(&format!("{BOT_PREFIX} poll ended")),
-    //         None,
-    //     )
-    //     .await
-    //     .unwrap();
-    // }
+    if let Some(old_poll_data) = bot_data.polls.get(room.room_id()) {
+        // there was a poll already created, hide it
+        let old_html = poll::create_poll_message_content_with_data(old_poll_data.clone()).await;
+        let wrapped = html! {
+            details {
+                summary { "Poll Ended" }
+                (old_html)
+            }
+        };
+        let msg = RoomMessageEventContent::text_html("poll ended", wrapped);
+        let replacement = msg.make_replacement(ReplacementMetadata::new(
+            old_poll_data.poll_event_id.clone(),
+            None,
+        ));
+        room.send(replacement).await.unwrap();
+    }
     let content = poll::create_poll_message().await;
     info!("sending poll");
     let r = room.send(content).await.unwrap();
@@ -211,7 +207,6 @@ async fn try_setup_auto_poll(
     bot_data: Arc<Mutex<BotData>>,
     room: &Room,
     time: &str,
-    skip_weekend: bool,
     send_confirmation: bool,
 ) -> bool {
     match NaiveTime::parse_from_str(time, "%H:%M") {
@@ -236,12 +231,11 @@ async fn try_setup_auto_poll(
                 let room = cloned_room;
                 loop {
                     interval.tick().await;
-                    if skip_weekend && matches!(Local::now().weekday(), Weekday::Sat | Weekday::Sun) {
+                    if matches!(Local::now().weekday(), Weekday::Sat | Weekday::Sun) {
                         // it is the weekend and we skip it
                         continue;
                     }
                     // it is the expected time of the day, send the poll
-                    // let bot_data = loop_data.lock().await;
                     send_poll(thread_bot_data.clone(), &room).await;
                 }
             });
@@ -331,7 +325,7 @@ async fn sync(
     for (room_id_str, time) in auto_polls {
         let room_id = <&RoomId>::try_from(&room_id_str[..])?;
         if let Some(room) = client.get_room(room_id) {
-            try_setup_auto_poll(data.clone(), &room, &time, true, false).await;
+            try_setup_auto_poll(data.clone(), &room, &time, false).await;
         };
     }
     info!("auto-polls restarted");
@@ -386,14 +380,9 @@ async fn sync(
                 room.send(replacement).await.unwrap();
             }
         }
-        // info!("user emoji select {:?}", data);
     });
 
-    // let mut auto_poll_threads: Vec<_> = vec![];
-
     // Now that we've synced, let's attach a handler for incoming room messages.
-    // let data3 = data.clone();
-    // let client3 = client.clone();
     let auto_poll_file_clone = auto_poll_file.to_path_buf();
     client.add_event_handler(|event: OriginalSyncRoomMessageEvent, room: Room| async move {
         let owned_auto_poll_file = auto_poll_file_clone.clone();
@@ -441,8 +430,7 @@ async fn sync(
                                     .await;
                                 return;
                             }
-                            let skip_weekend = command.get(3).is_some_and(|&s| s == "+no_we");
-                            if try_setup_auto_poll(data.clone(), &room, command[2], skip_weekend, true).await {
+                            if try_setup_auto_poll(data.clone(), &room, command[2], true).await {
                                 let _ = save_auto_polls(
                                     &owned_auto_poll_file,
                                     data.lock()

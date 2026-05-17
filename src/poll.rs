@@ -32,7 +32,7 @@ pub async fn create_poll_message() -> RoomMessageEventContent {
     RoomMessageEventContent::text_html("the poll, but your client doesn't render html", html_content)
 }
 
-pub async fn create_poll_message_with_data(data: PollData) -> RoomMessageEventContent {
+pub async fn create_poll_message_content_with_data(data: PollData) -> PreEscaped<String> {
     let dishes = match fetch_restaurant_menus().await {
         Ok(d) => d,
         Err(e) => {
@@ -40,7 +40,7 @@ pub async fn create_poll_message_with_data(data: PollData) -> RoomMessageEventCo
             vec![]
         }
     };
-    let html_content = html! {
+    html! {
         h1 { "Miam Daily Poll" }
         p { (PollSelection::LabriWithFood.as_emoji()) (PreEscaped("&nbsp;I will eat at LaBRI and already have my food")) }
         @if !data.labri_with_food.is_empty() {
@@ -91,8 +91,13 @@ pub async fn create_poll_message_with_data(data: PollData) -> RoomMessageEventCo
                 }
             }
         }
-    };
-    RoomMessageEventContent::text_html("the poll, but your client doesn't render html", html_content)
+    }
+
+}
+
+pub async fn create_poll_message_with_data(data: PollData) -> RoomMessageEventContent {
+    let html_content = create_poll_message_content_with_data(data).await;
+    RoomMessageEventContent::text_html("Today's miam poll", html_content)
 }
 
 pub async fn create_menu_message() -> RoomMessageEventContent {
